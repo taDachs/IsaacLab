@@ -22,6 +22,7 @@ from omni.isaac.core.utils.torch.rotations import (
     get_euler_xyz,
 )
 from omni.isaac.lab_tasks.direct.locomotion.locomotion_env import LocomotionEnv
+from omni.isaac.lab.utils.math import euler_xyz_from_quat
 
 
 OBSERVATION_DIMS = {
@@ -67,9 +68,7 @@ class BoltEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=8192, env_spacing=4.0, replicate_physics=True
-    )
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=16384, env_spacing=4.0, replicate_physics=True)
     robot: ArticulationCfg = BOLT_CFG.replace(prim_path="/World/envs/env_.*/Robot")
 
     contact_sensor: ContactSensorCfg = ContactSensorCfg(
@@ -90,6 +89,8 @@ class BoltEnvCfg(DirectRLEnvCfg):
 
     lin_vel_reward_weight = 2.0
     yaw_rate_reward_weight = 0.5
+    yaw_tracking_weight = 1.0
+    angular_velocity_error = -0.5
     z_vel_reward_weight: float = -2.0
     energy_cost_weight: float = -0.00001
     action_rate_weight: float = -0.01
@@ -106,13 +107,7 @@ class BoltEnvCfg(DirectRLEnvCfg):
 
     angular_velocity_scale: float = 0.25
     contact_force_scale: float = 0.01
-    step_threshold: float = 0.7
-
-# class BoltEnv(LocomotionEnv):
-#     cfg: BoltEnvCfg
-#
-#     def __init__(self, cfg: BoltEnvCfg, render_mode: str | None = None, **kwargs):
-#         super().__init__(cfg, render_mode, **kwargs)
+    step_threshold: float = 0.6
 
 
 class BoltEnv(DirectRLEnv):
@@ -123,21 +118,16 @@ class BoltEnv(DirectRLEnv):
 
         # joint effort command
         self._actions = torch.zeros(self.num_envs, self.cfg.num_actions, device=self.device)
-        self._previous_actions = torch.zeros(
-            self.num_envs, self.cfg.num_actions, device=self.device
-        )
+        self._previous_actions = torch.zeros(self.num_envs, self.cfg.num_actions, device=self.device)
 
         # X/Y linear velocity and yaw angular velocity commands
         self._commands = torch.zeros(self.num_envs, 3, device=self.device)
-        self._commands[:, 0] = 0.5
 
         self._base_id, _ = self._contact_sensor.find_bodies("base_link")
         self._feet_ids, _ = self._contact_sensor.find_bodies(".*_FOOT")
         self._undesired_contact_body_ids, _ = self._contact_sensor.find_bodies(".*(?<!_FOOT)")
 
-        self.joint_gears = torch.tensor(
-            self.cfg.joint_gears, dtype=torch.float32, device=self.sim.device
-        )
+        self.joint_gears = torch.tensor(self.cfg.joint_gears, dtype=torch.float32, device=self.sim.device)
         self._joint_dof_idx, _ = self._robot.find_joints(".*")
         self._hip_joint_idx, _ = self._robot.find_joints(".*_HAA")
 
@@ -145,7 +135,8 @@ class BoltEnv(DirectRLEnv):
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
                 "track_lin_vel_xy_exp",
-                "track_ang_vel_z_exp",
+                # "track_ang_vel_z_exp",
+                "track_yaw_angle_l2",
                 "lin_vel_z_l2",
                 "energy_cost",
                 "joint_accel",
@@ -155,6 +146,7 @@ class BoltEnv(DirectRLEnv):
                 "target_height_error_l2",
                 "feet_air_time",
                 "hip_deviation_l1",
+                "minimize_angular_velocity",
             ]
         }
 
@@ -210,14 +202,18 @@ class BoltEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         # linear velocity tracking
-        lin_vel_error = torch.sum(
-            torch.square(self._commands[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1
-        )
+        lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1)
         lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25)
 
         # yaw rate tracking
-        yaw_rate_error = torch.square(self._commands[:, 2] - self._robot.data.root_ang_vel_b[:, 2])
-        yaw_rate_error_mapped = torch.exp(-yaw_rate_error / 0.25)
+        # yaw_rate_error = torch.square(self._commands[:, 2] - self._robot.data.root_ang_vel_b[:, 2])
+        # yaw_rate_error_mapped = torch.exp(-yaw_rate_error / 0.25)
+        yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)[2]
+        yaw_error = torch.square(self._commands[:, 2] - yaw)
+        yaw_error_mapped = torch.exp(-yaw_error / 0.25)
+
+        # minimize angular velocity
+        angular_velocity = torch.sum(torch.square(self._robot.data.root_ang_vel_b), dim=1)
 
         height = self._robot.data.root_pos_w[:, 2]
         target_height_error = torch.square(self.cfg.target_height - height)
@@ -232,9 +228,7 @@ class BoltEnv(DirectRLEnv):
         # action rate (basically jerk)
         action_rate = torch.sum(torch.square(self._actions - self._previous_actions), dim=1)
 
-        flat_orientation = torch.sum(
-            torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1
-        )
+        flat_orientation = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1)
 
         # feet air time
         first_contact = self._contact_sensor.compute_first_contact(self.step_dt)[:, self._feet_ids]
@@ -244,7 +238,7 @@ class BoltEnv(DirectRLEnv):
         )
 
         # hip deviation
-        join_deviation = torch.sum(
+        joint_deviation = torch.sum(
             torch.abs(
                 self._robot.data.joint_pos[:, self._hip_joint_idx]
                 - self._robot.data.default_joint_pos[:, self._hip_joint_idx]
@@ -253,12 +247,9 @@ class BoltEnv(DirectRLEnv):
         )
 
         rewards = {
-            "track_lin_vel_xy_exp": self.cfg.lin_vel_reward_weight
-            * lin_vel_error_mapped
-            * self.step_dt,
-            "track_ang_vel_z_exp": self.cfg.yaw_rate_reward_weight
-            * yaw_rate_error_mapped
-            * self.step_dt,
+            "track_lin_vel_xy_exp": self.cfg.lin_vel_reward_weight * lin_vel_error_mapped * self.step_dt,
+            # "track_ang_vel_z_exp": self.cfg.yaw_rate_reward_weight * yaw_rate_error_mapped * self.step_dt,
+            "track_yaw_angle_l2": self.cfg.yaw_tracking_weight * yaw_error_mapped * self.step_dt,
             "lin_vel_z_l2": self.cfg.z_vel_reward_weight * z_vel_error * self.step_dt,
             "energy_cost": self.cfg.energy_cost_weight * joint_torques * self.step_dt,
             "joint_accel": self.cfg.joint_accel_weight * joint_accel * self.step_dt,
@@ -269,7 +260,8 @@ class BoltEnv(DirectRLEnv):
             * self.step_dt,
             "target_height_error_l2": self.cfg.target_height_error_weight * target_height_error * self.step_dt,
             "feet_air_time": self.cfg.feet_air_time_reward_scale * air_time * self.step_dt,
-            "hip_deviation_l1": self.cfg.hip_deviation_weight * join_deviation * self.step_dt,
+            "hip_deviation_l1": self.cfg.hip_deviation_weight * joint_deviation * self.step_dt,
+            "minimize_angular_velocity": self.cfg.angular_velocity_error * angular_velocity * self.step_dt
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
@@ -313,10 +305,6 @@ class BoltEnv(DirectRLEnv):
         self.extras["log"] = dict()
         self.extras["log"].update(extras)
         extras = dict()
-        extras["Episode Termination/height"] = torch.count_nonzero(
-            self.reset_terminated[env_ids]
-        ).item()
-        extras["Episode Termination/time_out"] = torch.count_nonzero(
-            self.reset_time_outs[env_ids]
-        ).item()
+        extras["Episode Termination/height"] = torch.count_nonzero(self.reset_terminated[env_ids]).item()
+        extras["Episode Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
         self.extras["log"].update(extras)

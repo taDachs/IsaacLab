@@ -149,6 +149,7 @@ class AnymalCEnv(DirectRLEnv):
                 "flat_orientation_l2",
             ]
         }
+
         # Get specific body indices
         self._base_id, _ = self._contact_sensor.find_bodies("base")
         self._feet_ids, _ = self._contact_sensor.find_bodies(".*FOOT")
@@ -203,14 +204,14 @@ class AnymalCEnv(DirectRLEnv):
             [
                 tensor
                 for tensor in (
-                    self._robot.data.root_lin_vel_b,
-                    self._robot.data.root_ang_vel_b,
-                    self._robot.data.projected_gravity_b,
-                    self._commands,
-                    self._robot.data.joint_pos - self._robot.data.default_joint_pos,
-                    self._robot.data.joint_vel,
-                    height_data,
-                    self._actions,
+                    self._robot.data.root_lin_vel_b,  # 3
+                    self._robot.data.root_ang_vel_b,  # 3
+                    self._robot.data.projected_gravity_b,  # 2
+                    self._commands,  # 3
+                    self._robot.data.joint_pos - self._robot.data.default_joint_pos,  # 12
+                    self._robot.data.joint_vel,  # 12
+                    height_data,  # 1
+                    self._actions,  # 12
                 )
                 if tensor is not None
             ],
